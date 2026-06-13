@@ -4,7 +4,7 @@
 
 An end-to-end Azure data pipeline that ingests supply chain order data (DataCo Supply Chain dataset, ~180K records), processes it incrementally using a metadata-driven design, and prepares it for analytics in a medallion (raw/silver/gold) architecture.
 
-![Architecture](images/architecture.png)
+![Architecture](images/supply_chain_azure_architecture.png)
 
 ---
 
