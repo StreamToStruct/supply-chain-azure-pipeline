@@ -197,3 +197,249 @@ Azure Key Vault
 
 ## Files
 - `notebooks/01_mount_adls_read_csv.ipynb`
+
+
+
+# Day 5 — PySpark Transformations: Dedup, Delay Flag, Silver + Gold Layer Writes
+
+## What We Did
+- Ran watermark filter — 180,518 rows pass (1 row filtered out)
+- Investigated duplicates — found 65,751 unique Order IDs across 180,518 rows
+- Discovered these are legitimate order line items (not duplicates) — max 5 line items per order
+- Built dedup safety check using row_number() window function — 0 rows dropped
+- Derived custom delay flag from raw columns (Days for shipping real > scheduled)
+- Found 4,423 row discrepancy between derived flag and source Late_delivery_risk column
+- Wrote cleaned data to ADLS silver layer (Parquet, partitioned by delay_flag)
+- Built vendor scorecard using window functions (dense_rank partitioned by Market)
+- Hit and fixed window shuffle warning by adding partitionBy("Market")
+- Wrote vendor scorecard to ADLS gold layer (Parquet, partitioned by Market)
+
+---
+
+## Full Notebook Code
+
+### Cell 5 — Watermark Filter
+```python
+from pyspark.sql.functions import to_timestamp, col
+
+# Hardcoded for now — will come from Azure SQL via Key Vault on Day 6
+watermark_date = "2015-01-01"
+
+df_filtered = df.withColumn(
+    "order_date_parsed",
+    to_timestamp(col("order date (DateOrders)"), "M/d/yyyy H:mm")
+).filter(
+    col("order_date_parsed") > watermark_date
+)
+
+print(f"Rows after watermark filter: {df_filtered.count()}")
+# Result: 180,518 rows (1 row filtered — order_date exactly 2015-01-01)
+```
+
+---
+
+### Cell 6 — Duplicate Investigation
+```python
+from pyspark.sql.functions import count
+
+# Check if Order Id is truly unique
+print(f"Before dedup: {df_filtered.count()}")
+print(f"Distinct Order IDs: {df_filtered.select('Order Id').distinct().count()}")
+# Result: 180,518 rows, 65,751 unique Order IDs
+# Finding: Same Order ID appears multiple times = legitimate order line items
+
+# Find max line items per order
+df_filtered.groupBy("Order Id") \
+    .agg(count("Order Item Id").alias("item_count")) \
+    .filter(col("item_count") > 1) \
+    .orderBy(col("item_count").desc()) \
+    .show(10)
+# Result: Max 5 line items per order — NOT duplicates
+
+# Confirm Order Item Id is the true primary key
+print(f"Distinct Order Item IDs: {df_filtered.select('Order Item Id').distinct().count()}")
+# Result: 180,518 — matches total rows exactly. Zero true duplicates.
+```
+
+**Key insight:**
+> "Investigated 180,518 rows with only 65,751 unique Order IDs. 
+> Initially appeared to be duplicates but analysis revealed these were 
+> legitimate order line items — one order can have up to 5 line items, 
+> each with a unique Order Item Id. Deduplication on Order Id would have 
+> incorrectly dropped valid data. Identified Order Item Id as true primary key."
+
+---
+
+### Cell 7 — Dedup Safety Check (on Order Item Id)
+```python
+from pyspark.sql.functions import row_number
+from pyspark.sql.window import Window
+
+# Safety dedup — in case source ever sends same line item twice
+window_spec = Window.partitionBy("Order Item Id").orderBy(col("order_date_parsed").desc())
+
+df_deduped = df_filtered.withColumn("row_num", row_number().over(window_spec)) \
+    .filter(col("row_num") == 1) \
+    .drop("row_num")
+
+print(f"After dedup: {df_deduped.count()}")
+# Result: 180,518 — zero rows dropped, confirms no real duplicates
+```
+
+---
+
+### Cell 8 — Derive Delay Flag
+```python
+from pyspark.sql.functions import when
+
+df_transformed = df_deduped.withColumn(
+    "delay_flag",
+    when(
+        col("Days for shipping (real)") > col("Days for shipment (scheduled)"),
+        1
+    ).otherwise(0)
+)
+
+# Compare derived flag vs existing source flag
+df_transformed.groupBy("delay_flag", "Late_delivery_risk") \
+    .count() \
+    .orderBy("delay_flag", "Late_delivery_risk") \
+    .show()
+```
+
+**Result:**
+```
++----------+------------------+-----+
+|delay_flag|Late_delivery_risk|count|
++----------+------------------+-----+
+|         0|                 0|77118|
+|         1|                 0| 4423|   <-- DISCREPANCY
+|         1|                 1|98977|
++----------+------------------+-----+
+```
+
+**Key insight:**
+> "Found 4,423 records where derived delay_flag=1 but source Late_delivery_risk=0. 
+> Did not blindly trust source flag — flagged discrepancy for business review. 
+> Possible source data quality issue or different business definition of late delivery."
+
+---
+
+### Cell 9 — Write to Silver Layer
+```python
+silver_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/silver/orders/"
+
+df_transformed.write \
+    .format("parquet") \
+    .mode("overwrite") \
+    .partitionBy("delay_flag") \
+    .save(silver_path)
+
+print("Written to silver layer successfully")
+
+# Verify
+df_silver_check = spark.read.format("parquet").load(silver_path)
+print(f"Rows in silver layer: {df_silver_check.count()}")
+print(f"Partitions: {df_silver_check.select('delay_flag').distinct().collect()}")
+# Result: 180,518 rows, partitions: delay_flag=0, delay_flag=1
+```
+
+**Why Parquet over CSV:**
+- Columnar format — reads only needed columns, not full row
+- Compressed — smaller storage cost
+- Partition pruning — queries filter by delay_flag without scanning all data
+- Industry standard for data lake silver/gold layers
+
+---
+
+### Cell 10 — Vendor Scorecard (Window Functions)
+```python
+from pyspark.sql.functions import count, sum, round, dense_rank
+from pyspark.sql.window import Window
+
+# Step 1: Aggregate by Market + Region
+vendor_scorecard = df_transformed.groupBy("Market", "Order Region") \
+    .agg(
+        count("Order Item Id").alias("total_orders"),
+        sum("delay_flag").alias("delayed_orders")
+    ) \
+    .withColumn(
+        "delay_pct",
+        round((col("delayed_orders") / col("total_orders")) * 100, 2)
+    )
+
+# Step 2: Rank regions within each market by delay %
+window_spec = Window.partitionBy("Market").orderBy(col("delay_pct").asc())
+
+vendor_scorecard_final = vendor_scorecard.withColumn(
+    "rank",
+    dense_rank().over(window_spec)
+)
+
+vendor_scorecard_final.orderBy("Market", "rank").show(50, truncate=False)
+```
+
+---
+
+### Cell 11 — Write Vendor Scorecard to Gold Layer
+```python
+gold_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/gold/vendor_scorecard/"
+
+vendor_scorecard_final.write \
+    .format("parquet") \
+    .mode("overwrite") \
+    .partitionBy("Market") \
+    .save(gold_path)
+
+print("Vendor scorecard written to gold layer successfully")
+```
+
+---
+
+## Landmines Hit Today
+
+### Landmine 1 — False Duplicate Alert
+**Symptom:** 180,518 rows but only 65,751 unique Order IDs
+**Initial assumption:** Duplicates exist
+**Root cause:** One order has multiple line items — each is a separate row
+**Fix:** Used Order Item Id (not Order Id) as dedup key
+**Lesson:** Always investigate before deduplicating — blind dedup on wrong key drops valid data
+
+### Landmine 2 — Source Flag Discrepancy
+**Symptom:** 4,423 rows where derived delay_flag ≠ source Late_delivery_risk
+**Root cause:** Unknown — possible different business logic in source system
+**Fix:** Used derived flag (from raw columns) as more trustworthy, flagged for business review
+**Lesson:** Never blindly trust pre-calculated flags in source data
+
+### Landmine 3 — Window Shuffle Warning
+**Symptom:** `No Partition Defined for Window operation! Moving all data to a single partition`
+**Root cause:** `Window.orderBy()` without `partitionBy()` forces all data to one executor
+**Fix:** Added `partitionBy("Market")` — ranks regions within each market independently
+**Lesson:** Always define partitionBy in window specs. Without it, performance degrades linearly with data size.
+
+---
+
+## Metrics
+- Rows after watermark filter: 180,518
+- True duplicates found: 0
+- Delay flag discrepancy: 4,423 rows
+- Silver layer: 180,518 rows, Parquet, partitioned by delay_flag (0/1)
+- Gold layer: 23 regions ranked within 5 markets, Parquet, partitioned by Market
+
+## ADLS Structure After Day 5
+```
+supplychain-project/
+├── raw/orders/full_load/DataCoSupplyChainDataset.csv
+├── silver/orders/
+│   ├── delay_flag=0/  (77,118 rows)
+│   └── delay_flag=1/  (103,400 rows)
+└── gold/vendor_scorecard/
+    ├── Market=Africa/
+    ├── Market=Europe/
+    ├── Market=LATAM/
+    ├── Market=Pacific Asia/
+    └── Market=USCA/
+```
+
+## Files
+- `notebooks/01_mount_adls_read_csv.ipynb`
