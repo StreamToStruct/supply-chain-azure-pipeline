@@ -1,0 +1,14 @@
+{
+	"name": "ls_AzureSQL_supplychain_meta",
+	"properties": {
+		"annotations": [],
+		"type": "AzureSqlDatabase",
+		"typeProperties": {
+			"server": "optimizationserver.database.windows.net",
+			"database": "supplychain_meta",
+			"encrypt": "mandatory",
+			"trustServerCertificate": false,
+			"authenticationType": "SystemAssignedManagedIdentity"
+		}
+	}
+}

@@ -1,0 +1,19 @@
+{
+	"name": "raw_data_dataset",
+	"properties": {
+		"linkedServiceName": {
+			"referenceName": "optimizationDataLakeStorage1",
+			"type": "LinkedServiceReference"
+		},
+		"annotations": [],
+		"type": "Json",
+		"typeProperties": {
+			"location": {
+				"type": "AzureBlobFSLocation",
+				"fileSystem": "raw-data"
+			}
+		},
+		"schema": {}
+	},
+	"type": "Microsoft.DataFactory/factories/datasets"
+}

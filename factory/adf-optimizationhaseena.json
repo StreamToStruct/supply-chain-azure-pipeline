@@ -1,0 +1,15 @@
+{
+	"name": "adf-optimizationhaseena",
+	"properties": {
+		"trustModeClaimForMi": {
+			"value": "Disabled",
+			"editable": true
+		}
+	},
+	"location": "centralindia",
+	"identity": {
+		"type": "SystemAssigned",
+		"principalId": "2a2e11f8-faf1-4e89-beb5-42fa459f21e6",
+		"tenantId": "adbe9f8b-36b2-459b-9b28-c913cae9ec04"
+	}
+}

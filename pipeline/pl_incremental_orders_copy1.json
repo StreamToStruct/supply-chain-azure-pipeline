@@ -1,0 +1,95 @@
+{
+	"name": "pl_incremental_orders_copy1",
+	"properties": {
+		"activities": [
+			{
+				"name": "lkp_get_watermark",
+				"type": "Lookup",
+				"dependsOn": [],
+				"policy": {
+					"timeout": "0.12:00:00",
+					"retry": 0,
+					"retryIntervalInSeconds": 30,
+					"secureOutput": false,
+					"secureInput": false
+				},
+				"userProperties": [],
+				"typeProperties": {
+					"source": {
+						"type": "AzureSqlSource",
+						"sqlReaderQuery": "SELECT last_load_date FROM pipeline_watermark WHERE table_name = 'orders'",
+						"queryTimeout": "02:00:00",
+						"partitionOption": "None"
+					},
+					"dataset": {
+						"referenceName": "AzureSqlTable1",
+						"type": "DatasetReference"
+					}
+				}
+			},
+			{
+				"name": "watermark_date",
+				"type": "SetVariable",
+				"dependsOn": [
+					{
+						"activity": "lkp_get_watermark",
+						"dependencyConditions": [
+							"Completed"
+						]
+					}
+				],
+				"policy": {
+					"secureOutput": false,
+					"secureInput": false
+				},
+				"userProperties": [],
+				"typeProperties": {
+					"variableName": "watermark_date",
+					"value": {
+						"value": "@activity('lkp_get_watermark').output.firstRow.last_load_date",
+						"type": "Expression"
+					}
+				}
+			},
+			{
+				"name": "Notebook1",
+				"type": "DatabricksNotebook",
+				"dependsOn": [
+					{
+						"activity": "watermark_date",
+						"dependencyConditions": [
+							"Completed"
+						]
+					}
+				],
+				"policy": {
+					"timeout": "0.12:00:00",
+					"retry": 0,
+					"retryIntervalInSeconds": 30,
+					"secureOutput": false,
+					"secureInput": false
+				},
+				"userProperties": [],
+				"typeProperties": {
+					"notebookPath": "/Users/syedyasmeen1609@gmail.com/01_mount_adls_read_csv",
+					"baseParameters": {
+						"watermark_date": {
+							"value": "@variables('watermark_date')",
+							"type": "Expression"
+						}
+					}
+				},
+				"linkedServiceName": {
+					"referenceName": "AzureDatabricksnotebook1",
+					"type": "LinkedServiceReference"
+				}
+			}
+		],
+		"variables": {
+			"watermark_date": {
+				"type": "String"
+			}
+		},
+		"annotations": []
+	}
+}
